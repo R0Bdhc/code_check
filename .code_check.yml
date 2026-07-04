@@ -1,0 +1,40 @@
+# ============================================================
+# .code_check.yml — Per-project configuration for code_check
+# ============================================================
+# Copy this file to your project root and customize.
+# All keys are optional — defaults are shown below.
+# ============================================================
+
+# Review mode: normal | strict | warn
+#   normal — CRITICAL blocks push, HIGH warns
+#   strict — HIGH also blocks push
+#   warn   — never blocks, only reports findings
+review_mode: normal
+
+# Skip review entirely (emergency override)
+# skip_review: true
+
+# Patterns to disable by name
+# Use this to suppress false positives specific to your project.
+ignore_patterns:
+  # - "GitHub OAuth"           # We use OAuth tokens in test fixtures
+  # - "Email (non-test)"       # Our docs contain example emails
+  # - "Chinese Phone"          # Test data includes fake phone numbers
+
+# Paths to skip entirely (glob patterns supported)
+ignore_paths:
+  # - "vendor/"
+  # - "generated/"
+  # - "**/testdata/"
+  # - "docs/examples/"
+
+# Add project-specific detection patterns
+# Format: "name | regex | level"
+# custom_patterns:
+#   secrets:
+#     # - "Internal API Key | mycompany_api_[A-Za-z0-9]{32} | CRITICAL"
+#   pii:
+#     # - "Employee ID | EMP-\d{6} | HIGH"
+#   logLeak: []
+#   weakCrypto: []
+#   dangerousExec: []

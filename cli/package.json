@@ -1,17 +1,23 @@
 {
   "name": "pre-push-review",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "🛡️ Pre-push code review gate — security audit, PII scan, log leak detection",
   "main": "index.js",
   "bin": {
     "pre-push-review": "./index.js"
   },
   "files": [
-    "index.js"
+    "index.js",
+    "../patterns.json",
+    "../lib/config.js",
+    "../lib/patterns.sh",
+    "../lib/config.sh",
+    "../hooks/pre-push"
   ],
   "scripts": {
     "test": "node --test",
-    "start": "node index.js"
+    "start": "node index.js",
+    "generate:patterns": "node ../scripts/generate-patterns-sh.js"
   },
   "keywords": [
     "security",
@@ -27,7 +33,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-org/pre-push-review.git"
+    "url": "https://github.com/R0Bdhc/code_check"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -4,7 +4,7 @@
 # 用法: 将此文件内容合并到你的 .gitlab-ci.yml，或使用 include:
 #
 #   include:
-#     - project: 'your-org/pre-push-review'
+#     - project: 'R0Bdhc/code_check'
 #       file: '/ci/gitlab-ci.yml'
 #       ref: 'main'
 #
@@ -16,6 +16,16 @@ stages:
 variables:
   REVIEW_MODE: "normal"  # normal | strict | warn
 
+# Common: determine diff base (events: MR vs push)
+.diff_base: &diff_base
+  - |
+    if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]; then
+      export DIFF_BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+    else
+      export DIFF_BASE="$CI_COMMIT_BEFORE_SHA"
+    fi
+  - apk add --no-cache git bash grep
+
 # ============================================================
 # 🔒 Security Audit
 # ============================================================
@@ -23,29 +33,36 @@ security-scan:
   stage: review
   image: alpine:latest
   before_script:
-    - apk add --no-cache git bash grep
+    - *diff_base
   script:
     - |
       echo "=== Scanning for hardcoded secrets ==="
-      SECRET_PATTERNS="AKIA[0-9A-Z]{16}
-      sk_live_[0-9a-zA-Z]{24,}
-      ghp_[0-9a-zA-Z]{36}
-      gho_[0-9a-zA-Z]{36}
-      xox[baprs]-[0-9a-zA-Z-]{10,}
-      AIza[0-9A-Za-z\-_]{35}"
-
       FAILED=0
-      for pattern in $SECRET_PATTERNS; do
-        MATCHES=$(git diff $CI_MERGE_REQUEST_DIFF_BASE_SHA..HEAD | grep -oE "$pattern" | sort -u || true)
-        if [[ -n "$MATCHES" ]]; then
-          echo "ERROR: Detected secret pattern: $pattern"
-          echo "$MATCHES"
+
+      # Only scan added lines to avoid false positives on secret removal
+      scan_secret() {
+        local pattern="$1"
+        local name="$2"
+        local matches
+        matches=$(git diff $DIFF_BASE..HEAD | grep -E '^\+[^+]' | grep -oE "$pattern" | sort -u || true)
+        if [[ -n "$matches" ]]; then
+          echo "ERROR: Detected $name"
+          echo "$matches"
           FAILED=1
         fi
-      done
+      }
 
-      # 检测 .env 文件
-      ENV_FILES=$(git diff --name-only $CI_MERGE_REQUEST_DIFF_BASE_SHA..HEAD | grep -E '(\.env$|\.env\.local$|\.env\.production$)' || true)
+      scan_secret 'AKIA[0-9A-Z]{16}' 'AWS Access Key'
+      scan_secret 'sk_live_[0-9a-zA-Z]{24,}' 'Stripe Live Key'
+      scan_secret 'ghp_[0-9a-zA-Z]{36}' 'GitHub Token'
+      scan_secret 'github_pat_[A-Za-z0-9_]{36,}' 'GitHub Fine-grained PAT'
+      scan_secret 'sk-(proj-|org-)?[A-Za-z0-9]{32,}' 'OpenAI API Key'
+      scan_secret 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' 'JWT Token'
+      scan_secret '-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----' 'Private Key Block'
+      scan_secret '(secret|token|password|api_key|apikey)\s*[:=]\s*["\047][^"\047]{8,}["\047]' 'Generic Secret Assignment'
+
+      # .env file detection
+      ENV_FILES=$(git diff --name-only $DIFF_BASE..HEAD | grep -E '(\.env$|\.env\.local$|\.env\.production$)' || true)
       if [[ -n "$ENV_FILES" ]]; then
         echo "ERROR: .env file in diff — possible credential leak"
         echo "$ENV_FILES"
@@ -53,11 +70,11 @@ security-scan:
       fi
 
       exit $FAILED
-  only:
-    - merge_requests
-    - main
-    - master
-    - develop
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_REF_NAME == "main"
+    - if: $CI_COMMIT_REF_NAME == "master"
+    - if: $CI_COMMIT_REF_NAME == "develop"
 
 # ============================================================
 # 🛡️ Privacy Scan (PII)
@@ -66,13 +83,13 @@ privacy-scan:
   stage: review
   image: alpine:latest
   before_script:
-    - apk add --no-cache git bash grep
+    - *diff_base
   script:
     - |
-      DIFF=$(git diff $CI_MERGE_REQUEST_DIFF_BASE_SHA..HEAD)
+      DIFF_ADDED=$(git diff $DIFF_BASE..HEAD | grep -E '^\+[^+]' || true)
 
       # 手机号
-      PHONES=$(echo "$DIFF" | grep -oE '1[3-9][0-9]{9}' | sort -u || true)
+      PHONES=$(echo "$DIFF_ADDED" | grep -oE '1[3-9][0-9]{9}' | sort -u || true)
       if [[ -n "$PHONES" ]]; then
         echo "ERROR: Found phone numbers in diff"
         echo "$PHONES"
@@ -80,26 +97,26 @@ privacy-scan:
       fi
 
       # 身份证号
-      IDS=$(echo "$DIFF" | grep -oE '[1-9][0-9]{5}(19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]' | sort -u || true)
+      IDS=$(echo "$DIFF_ADDED" | grep -oE '[1-9][0-9]{5}(19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]' | sort -u || true)
       if [[ -n "$IDS" ]]; then
         echo "ERROR: Found ID card numbers in diff"
         echo "$IDS"
         exit 1
       fi
 
-      # 邮箱
-      EMAILS=$(echo "$DIFF" | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | grep -vE '(test@|example@|localhost)' | sort -u || true)
+      # 邮箱 (排除 test/example)
+      EMAILS=$(echo "$DIFF_ADDED" | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | grep -vE '(test@|example@|localhost)' | sort -u || true)
       if [[ -n "$EMAILS" ]]; then
         echo "WARNING: Found email addresses in diff"
         echo "$EMAILS"
       fi
 
       echo "PII scan completed"
-  only:
-    - merge_requests
-    - main
-    - master
-    - develop
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_REF_NAME == "main"
+    - if: $CI_COMMIT_REF_NAME == "master"
+    - if: $CI_COMMIT_REF_NAME == "develop"
 
 # ============================================================
 # 📋 Log Leak Detection
@@ -108,19 +125,19 @@ log-leak-check:
   stage: review
   image: alpine:latest
   before_script:
-    - apk add --no-cache git bash grep
+    - *diff_base
   script:
     - |
-      DIFF=$(git diff $CI_MERGE_REQUEST_DIFF_BASE_SHA..HEAD)
-      LEAKS=$(echo "$DIFF" | grep -E '(console\.(log|error|warn|debug|info)|println!|log\.|logger\.|logging\.)' | grep -iE '(password|secret|token|key|credential|pii|ssn|credit|card)' || true)
+      DIFF_ADDED=$(git diff $DIFF_BASE..HEAD | grep -E '^\+[^+]' || true)
+      LEAKS=$(echo "$DIFF_ADDED" | grep -E '(console\.(log|error|warn|debug|info)|println!|log\.|logger\.|logging\.)' | grep -iE '(password|secret|token|key|credential|pii|ssn|credit|card)' || true)
       if [[ -n "$LEAKS" ]]; then
         echo "ERROR: Potential sensitive data in log statements"
         echo "$LEAKS"
         exit 1
       fi
       echo "Log leak check passed"
-  only:
-    - merge_requests
-    - main
-    - master
-    - develop
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_REF_NAME == "main"
+    - if: $CI_COMMIT_REF_NAME == "master"
+    - if: $CI_COMMIT_REF_NAME == "develop"

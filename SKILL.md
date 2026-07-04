@@ -43,26 +43,41 @@ git diff origin/$(git branch --show-current)..HEAD
 
 #### 2.1 个人身份信息 (PII)
 
-用 `grep` 在改动的文件中搜索：
+用 `grep` 在改动文件的**新增行**中搜索（排除删除行，防止修复安全问题的 commit 被误拦）：
+
+> 完整模式定义参见 `patterns.json`（集中式配置源，供所有 bash/Node.js/CI 消费者引用）。
 
 | 模式 | 正则表达式 | 风险等级 |
 |------|-----------|---------|
 | 邮箱地址 | `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}` | ⚠️ HIGH |
 | 手机号 (中国) | `1[3-9]\d{9}` | ⚠️ HIGH |
-| 身份证号 (中国) | `\d{17}[\dXx]` | ⚠️ CRITICAL |
-| IP 地址 | `\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}` | ⚠️ HIGH |
+| 身份证号 (中国) | `[1-9]\d{5}(19\|20)\d{2}(0[1-9]\|1[0-2])(0[1-9]\|[12]\d\|3[01])\d{3}[\dXx]` | ⚠️ CRITICAL |
+| IP 地址 | `\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}` (排除私有/链路本地/多播) | ⚠️ MEDIUM |
 | 信用卡号 | `\d{13,19}` (需结合上下文判断) | ⚠️ CRITICAL |
 | AWS Access Key | `AKIA[0-9A-Z]{16}` | ⚠️ CRITICAL |
 | Generic Secret | `(secret\|token\|password\|api_key)\s*[:=]\s*["'][^"']+["']` | ⚠️ CRITICAL |
 
-#### 2.2 数据泄露风险
+#### 2.2 新增安全模式 (v2.0)
+
+以下模式在 v2.0 中新增，补全安全检测盲区：
+
+| 模式 | 正则表达式 | 风险等级 |
+|------|-----------|---------|
+| JWT Token | `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}` | ⚠️ CRITICAL |
+| Private Key | `-----BEGIN (RSA\|EC\|DSA\|OPENSSH) PRIVATE KEY-----` | ⚠️ CRITICAL |
+| GitHub Fine-grained PAT | `github_pat_[A-Za-z0-9_]{36,}` | ⚠️ CRITICAL |
+| OpenAI API Key | `sk-(proj-\|org-)?[A-Za-z0-9]{32,}` | ⚠️ CRITICAL |
+| Weak Hash (MD5/SHA1) | `\b(?:MD5\|SHA-?1)\b` | ⚠️ HIGH |
+| Dangerous Exec | `\b(?:eval\|exec\|system\|shell_exec\|popen)\s*\(` | ⚠️ HIGH |
+
+#### 2.3 数据泄露风险
 
 - **日志泄露**：`console.log` / `print` / `logger.info` 中是否打印了用户输入或敏感字段
 - **错误消息泄露**：错误响应中是否暴露了内部路径、数据库 schema、stack trace
 - **API 响应过度**：返回给前端的 JSON 是否包含了不该暴露的字段（password hash、内部 ID）
 - **URL 参数**：GET 请求的 URL 中是否夹带了敏感参数
 
-#### 2.3 隐私合规
+#### 2.4 隐私合规
 
 - 是否涉及用户数据采集但没有对应的 consent 机制
 - 数据传输是否使用了加密通道 (HTTPS/TLS)
@@ -146,13 +161,43 @@ git diff origin/$(git branch --show-current)..HEAD
 - **给出修复建议**：每个发现必须附带具体的、可操作的修复方案，而非仅仅指出问题
 - **温暖但坚定**：发现严重问题时直说，不要犹豫。推送有问题代码比得罪人更糟。
 - **上下文敏感**：测试夹具中的假数据（如 `test@example.com`）不应标记为 PII
+- **仅扫描新增行**：只检查 `+` 开头的行（排除 `+++` diff headers），已删除的代码不触发告警
+- **项目配置优先**：如果项目根目录存在 `.code_check.yml`，其中的 `ignore_patterns` 和 `ignore_paths` 配置优先于默认规则
+
+## 姊妹 Skills
+
+code_check 提供 4 个互补 Skills，覆盖开发全流程：
+
+| Skill | 触发时机 | 与你关系 |
+|-------|---------|---------|
+| `pre-push-review` (你) | `git push` 前 | — |
+| `code-debugger` | 手动调用 / Agent 委托 | 调试代码 |
+| `pull-audit` | PR 打开时 | PR 门禁审查 |
+| `cross-agent-audit` | 任何 Agent 调用 | 库级变更审计 + debug + 安全 |
+
+`cross-agent-audit` 可被任何 Agent 调用：
+```bash
+/cross-agent-audit check /path/to/library
+bash cross-agent/check.sh /path/to/library --full
+```
 
 ## 工具约束
 
 你只能使用以下工具：
 - `bash` — 获取 git diff、运行 pattern 扫描
-- `grep` — 搜索隐私模式
+- `grep` — 搜索隐私模式（优先用 `grep -E '^\+[^+]'` 过滤新增行）
 - `read_file` — 读取特定文件确认上下文
 - `glob` — 确认改动文件列表
 - `security_review` — 内置安全审查
 - `review` — 内置代码审查
+
+## 扩展审查维度 (v2.0)
+
+除原始安全审计外，还应检查：
+- **弱加密算法**: MD5, SHA1, DES, RC4, ECB mode
+- **危险函数调用**: eval, exec, system, shell_exec, popen, subprocess.call
+- **JWT Token 泄露**: `eyJ...` 格式的未加密 Token
+- **私钥泄露**: `-----BEGIN RSA PRIVATE KEY-----` 等 PEM 标记
+- **OpenAI / API Key 泄露**: `sk-...` 前缀的密钥
+
+> 完整模式列表和正则表达式参见 `patterns.json`。项目可通过 `.code_check.yml` 自定义。 

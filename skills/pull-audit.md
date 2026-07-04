@@ -54,17 +54,24 @@ git diff origin/main...HEAD
 ### Step 2 — 🛡️ 隐私审计
 
 #### 2.1 PII 扫描
+
+> 完整模式列表和正则表达式参见项目根目录 `patterns.json`。bash 脚本通过 `lib/patterns.sh` 引用。
+
 | 模式 | 正则 | 等级 |
 |------|------|------|
 | 邮箱 | `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}` | HIGH |
 | 手机号 | `1[3-9]\d{9}` | HIGH |
-| 身份证 | `\d{17}[\dXx]` | CRITICAL |
-| IP 地址 | `\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}` | HIGH |
+| 身份证 | `[1-9]\d{5}(19\|20)\d{2}(0[1-9]\|1[0-2])(0[1-9]\|[12]\d\|3[01])\d{3}[\dXx]` | CRITICAL |
+| IP 地址 | `\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}` | MEDIUM |
+| JWT Token | `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}` | CRITICAL |
+| Private Key | `-----BEGIN (RSA\|EC\|DSA\|OPENSSH) PRIVATE KEY-----` | CRITICAL |
+| GitHub Fine-grained PAT | `github_pat_[A-Za-z0-9_]{36,}` | CRITICAL |
+| OpenAI Key | `sk-(proj-\|org-)?[A-Za-z0-9]{32,}` | CRITICAL |
 | 信用卡 | `\d{13,19}` (上下文判定) | CRITICAL |
 | AWS Key | `AKIA[0-9A-Z]{16}` | CRITICAL |
 | Generic Token | `(secret\|token\|password\|api_key)\s*[:=]\s*["'][^"']+["']` | CRITICAL |
 
-> 排除规则：测试文件(`*_test.*`, `test/`, `__tests__/`, `test@example.com`, `127.0.0.1`, `localhost`)中的假数据不标记。
+> 排除规则：测试文件(`*_test.*`, `test/`, `__tests__/`, `test@example.com`, `127.0.0.1`, `localhost`)中的假数据不标记。**仅扫描新增行**（`+` 行排除 `+++` headers）。
 
 #### 2.2 隐私合规检查
 - **数据采集**: 是否有用户数据采集但没有告知/同意机制

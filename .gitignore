@@ -2,3 +2,11 @@ node_modules/
 .DS_Store
 *.log
 dist/
+
+# Cross-agent audit state files (machine-specific paths and SHAs)
+state/*.json
+!state/.gitkeep
+
+# Cross-agent audit report history
+cross-agent/reports/*.md
+!cross-agent/reports/.gitkeep

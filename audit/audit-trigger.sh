@@ -8,19 +8,66 @@
 #   bash audit/audit-trigger.sh <PR_NUMBER>
 #   bash audit/audit-trigger.sh --branch <branch>
 #   bash audit/audit-trigger.sh --diff
+#   bash audit/audit-trigger.sh --dry-run --diff
 # ============================================================
 
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+# --- 确定脚本目录 ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- 加载共享库 ---
+if [[ -f "$SCRIPT_DIR/../lib/patterns.sh" ]]; then
+  source "$SCRIPT_DIR/../lib/patterns.sh"
+fi
+if [[ -f "$SCRIPT_DIR/../lib/config.sh" ]]; then
+  source "$SCRIPT_DIR/../lib/config.sh"
+fi
+
+# --- 加载项目配置 ---
+load_project_config 2>/dev/null || true
 
 echo -e "${BLUE}🛡️ Pull Audit — 安全隐私审计启动${NC}"
 echo ""
 
+DRY_RUN=0
+
+# ─── 参数解析 ───
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+  esac
+done
+
 # ─── 获取变更 ───
 DIFF=""
+PR_NUM=""
 
 case "${1:-}" in
+  --dry-run)
+    DRY_RUN=1
+    # 继续处理后面的参数
+    case "${2:-}" in
+      --branch)
+        BRANCH="${3:-}"
+        if [[ -z "$BRANCH" ]]; then
+          echo "用法: bash audit/audit-trigger.sh --dry-run --branch <branch>"
+          exit 1
+        fi
+        echo "→ 审计分支: $BRANCH vs origin/main"
+        git fetch origin main 2>/dev/null || true
+        DIFF=$(git diff origin/main..."$BRANCH" 2>/dev/null || git diff main..."$BRANCH" 2>/dev/null || echo "")
+        ;;
+      --diff)
+        echo "→ 审计 staged diff"
+        DIFF=$(git diff --staged 2>/dev/null || echo "")
+        ;;
+      *)
+        echo "→ 审计当前分支 vs origin/main"
+        DIFF=$(git diff origin/main...HEAD 2>/dev/null || git diff main...HEAD 2>/dev/null || echo "")
+        ;;
+    esac
+    ;;
   --branch)
     BRANCH="${2:-}"
     if [[ -z "$BRANCH" ]]; then
@@ -29,28 +76,31 @@ case "${1:-}" in
     fi
     echo "→ 审计分支: $BRANCH vs origin/main"
     git fetch origin main 2>/dev/null || true
-    DIFF=$(git diff origin/main..."$BRANCH" 2>/dev/null || git diff main..."$BRANCH")
+    DIFF=$(git diff origin/main..."$BRANCH" 2>/dev/null || git diff main..."$BRANCH" 2>/dev/null || echo "")
     ;;
-  
+
   --diff)
     echo "→ 审计 staged diff"
-    DIFF=$(git diff --staged)
+    DIFF=$(git diff --staged 2>/dev/null || echo "")
     ;;
-  
+
   *)
     PR="${1:-}"
-    if [[ -n "$PR" ]]; then
+    if [[ -n "$PR" ]] && [[ "$PR" =~ ^[0-9]+$ ]]; then
+      PR_NUM="$PR"
       echo "→ 审计 PR #${PR}"
       if command -v gh &>/dev/null; then
         DIFF=$(gh pr diff "$PR" --color=never 2>/dev/null || echo "")
       fi
       if [[ -z "$DIFF" ]]; then
         git fetch origin "pull/${PR}/head:pr-${PR}" 2>/dev/null || true
-        DIFF=$(git diff main..."pr-${PR}" 2>/dev/null || echo "")
+        # 注册清理 — 审计结束后删除临时分支
+        register_cleanup "pr-${PR}"
+        DIFF=$(git diff main..."pr-${PR}" 2>/dev/null || git diff master..."pr-${PR}" 2>/dev/null || echo "")
       fi
     else
       echo "→ 审计当前分支 vs origin/main"
-      DIFF=$(git diff origin/main...HEAD 2>/dev/null || git diff main...HEAD)
+      DIFF=$(git diff origin/main...HEAD 2>/dev/null || git diff main...HEAD 2>/dev/null || echo "")
     fi
     ;;
 esac
@@ -60,11 +110,21 @@ if [[ -z "$DIFF" ]]; then
   exit 0
 fi
 
-# ─── 统计 ───
-FILES_CHANGED=$(echo "$DIFF" | grep -c '^diff --git' || echo 0)
-LINES_ADDED=$(echo "$DIFF" | grep -c '^+' || echo 0)
-echo "变更: ${FILES_CHANGED} 个文件, +${LINES_ADDED} 行"
+# ─── 统计 (仅计算新增行，排除 +++ diff headers) ───
+FILES_CHANGED=$(echo "$DIFF" | grep -c '^diff --git' 2>/dev/null || echo "0")
+LINES_ADDED=$(echo "$DIFF" | grep -cE '^\+[^+]' 2>/dev/null || echo "0")
+LINES_DELETED=$(echo "$DIFF" | grep -cE '^\-[^-]' 2>/dev/null || echo "0")
+
+# Sanitize — ensure numeric
+if ! [[ "$FILES_CHANGED" =~ ^[0-9]+$ ]]; then FILES_CHANGED=0; fi
+if ! [[ "$LINES_ADDED" =~ ^[0-9]+$ ]]; then LINES_ADDED=0; fi
+if ! [[ "$LINES_DELETED" =~ ^[0-9]+$ ]]; then LINES_DELETED=0; fi
+
+echo "变更: ${FILES_CHANGED} 个文件, +${LINES_ADDED}/-${LINES_DELETED} 行"
 echo ""
+
+# 提取仅新增行 (排除删除行，防止修复 bug 时误报)
+DIFF_ADDED=$(echo "$DIFF" | grep -E '^\+[^+]' 2>/dev/null || echo "")
 
 # ═══════════════════════════════════════════════════════════
 # 🔒 安全审计
@@ -76,52 +136,47 @@ HIGH=0
 MEDIUM=0
 
 # 1. 硬编码密钥
-SECRET_PATTERNS=(
-  'AKIA[0-9A-Z]{16}:AWS Access Key'
-  'sk_live_[0-9a-zA-Z]{24,}:Stripe Live Key'
-  'ghp_[0-9a-zA-Z]{36}:GitHub Token'
-  'xox[baprs]-[0-9a-zA-Z-]{10,}:Slack Token'
-  'AIza[0-9A-Za-z\-_]{35}:Google API Key'
-  'ya29\.[0-9A-Za-z\-_]+:Google OAuth Token'
-)
-
 for entry in "${SECRET_PATTERNS[@]}"; do
   pattern="${entry%%:*}"
-  name="${entry##*:}"
-  MATCHES=$(echo "$DIFF" | grep -oE "$pattern" | sort -u || true)
+  rest="${entry#*:}"
+  name="${rest%%:*}"
+  level="${rest##*:}"
+
+  # 跳过被忽略的模式
+  if command -v should_ignore_pattern &>/dev/null && should_ignore_pattern "$name"; then
+    continue
+  fi
+
+  MATCHES=$(echo "$DIFF_ADDED" | grep -oE -- "$pattern" 2>/dev/null | sort -u || true)
   if [[ -n "$MATCHES" ]]; then
-    echo -e "  ${RED}🛑 $name${NC}"
-    echo "$MATCHES" | while read m; do echo "     $m"; done
-    CRITICAL=$((CRITICAL + 1))
+    print_result "$level" "$name"
+    echo "$MATCHES" | while read -r m; do echo "     $m"; done
+    case "$level" in
+      CRITICAL) CRITICAL=$((CRITICAL + 1)) ;;
+      HIGH)     HIGH=$((HIGH + 1)) ;;
+      MEDIUM)   MEDIUM=$((MEDIUM + 1)) ;;
+    esac
   fi
 done
 
-# 2. 通用密钥赋值
-GENERIC_SECRETS=$(echo "$DIFF" | grep -iE '(secret|token|password|api_key|apikey)\s*[:=]\s*["'"'"'][^"'"'"']{8,}["'"'"']' | head -10 || true)
-if [[ -n "$GENERIC_SECRETS" ]]; then
-  echo -e "  ${RED}🛑 检测到疑似硬编码密钥/密码${NC}"
-  CRITICAL=$((CRITICAL + 1))
+# 2. 高熵字符串
+HIGH_ENTROPY=$(echo "$DIFF_ADDED" | grep -oE "[A-Za-z0-9+/=]{${ENTROPY_THRESHOLD:-40},}" 2>/dev/null | sort -u | head -20 || true)
+if [[ -n "$HIGH_ENTROPY" ]]; then
+  for ex_pattern in "${ENTROPY_EXCLUDE_PATTERNS[@]}"; do
+    HIGH_ENTROPY=$(echo "$HIGH_ENTROPY" | grep -vE "$ex_pattern" 2>/dev/null || true)
+  done
+fi
+if [[ -n "$HIGH_ENTROPY" ]]; then
+  print_result "MEDIUM" "检测到高熵字符串（可能是密钥/Token）"
+  echo "$HIGH_ENTROPY" | while read -r line; do echo "     $line"; done
+  MEDIUM=$((MEDIUM + 1))
 fi
 
 # 3. .env 文件
-ENV_LEAK=$(echo "$DIFF" | grep -E '^\+.*\.env' | head -5 || true)
+ENV_LEAK=$(echo "$DIFF" | grep -E '^\+.*\.env' 2>/dev/null | head -5 || true)
 if [[ -n "$ENV_LEAK" ]]; then
-  echo -e "  ${RED}🛑 .env 文件可能泄露${NC}"
+  print_result "CRITICAL" ".env 文件可能泄露"
   CRITICAL=$((CRITICAL + 1))
-fi
-
-# 4. 弱加密
-WEAK_CRYPTO=$(echo "$DIFF" | grep -E '(MD5|SHA-?1|DES|RC4|ECB mode)' | head -5 || true)
-if [[ -n "$WEAK_CRYPTO" ]]; then
-  echo -e "  ${YELLOW}⚠️  检测到弱加密算法${NC}"
-  HIGH=$((HIGH + 1))
-fi
-
-# 5. eval / exec
-DANGEROUS_EXEC=$(echo "$DIFF" | grep -E '\b(eval|exec|system|shell_exec|popen|subprocess\.call)\s*\(' | head -5 || true)
-if [[ -n "$DANGEROUS_EXEC" ]]; then
-  echo -e "  ${YELLOW}⚠️  检测到潜在危险函数调用${NC}"
-  HIGH=$((HIGH + 1))
 fi
 
 echo ""
@@ -131,33 +186,38 @@ echo ""
 # ═══════════════════════════════════════════════════════════
 echo -e "${BLUE}--- 🛡️ 隐私扫描 ---${NC}"
 
-# 手机号
-PHONES=$(echo "$DIFF" | grep -oE '1[3-9][0-9]{9}' | sort -u | head -5 || true)
-if [[ -n "$PHONES" ]]; then
-  echo -e "  ${RED}🛑 检测到手机号${NC}"
-  CRITICAL=$((CRITICAL + 1))
-fi
+for entry in "${PII_PATTERNS[@]}"; do
+  pattern="${entry%%:*}"
+  rest="${entry#*:}"
+  name="${rest%%:*}"
+  level="${rest##*:}"
 
-# 身份证
-ID_CARDS=$(echo "$DIFF" | grep -oE '[1-9][0-9]{5}(19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]' | sort -u | head -5 || true)
-if [[ -n "$ID_CARDS" ]]; then
-  echo -e "  ${RED}🛑 检测到身份证号！${NC}"
-  CRITICAL=$((CRITICAL + 1))
-fi
+  if command -v should_ignore_pattern &>/dev/null && should_ignore_pattern "$name"; then
+    continue
+  fi
 
-# 邮箱（排除测试）
-EMAILS=$(echo "$DIFF" | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | grep -vE '(test@|example@|localhost|your-?email|test_)' | sort -u | head -5 || true)
-if [[ -n "$EMAILS" ]]; then
-  echo -e "  ${YELLOW}⚠️  检测到疑似真实邮箱${NC}"
-  HIGH=$((HIGH + 1))
-fi
+  MATCHES=$(echo "$DIFF_ADDED" | grep -oE -- "$pattern" 2>/dev/null | sort -u || true)
 
-# IP (排除私有)
-IPS=$(echo "$DIFF" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -vE '(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.0\.0\.0)' | sort -u | head -5 || true)
-if [[ -n "$IPS" ]]; then
-  echo -e "  ${YELLOW}⚠️  检测到疑似真实 IP${NC}"
-  MEDIUM=$((MEDIUM + 1))
-fi
+  # 邮箱排除
+  if [[ "$name" == "Email (non-test)" ]] && [[ -n "$MATCHES" ]]; then
+    MATCHES=$(echo "$MATCHES" | grep -vE '(test@|example@|localhost|your-?email|test_)' 2>/dev/null || true)
+  fi
+
+  # IP 排除
+  if [[ "$name" == "IP Address (non-private)" ]] && [[ -n "$MATCHES" ]]; then
+    MATCHES=$(echo "$MATCHES" | grep -vE '(^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^0\.0\.0\.0|^169\.254\.|^22[4-9]\.|^23[0-9]\.)' 2>/dev/null || true)
+  fi
+
+  if [[ -n "$MATCHES" ]]; then
+    print_result "$level" "$name"
+    echo "$MATCHES" | head -5 | while read -r m; do echo "     $m"; done
+    case "$level" in
+      CRITICAL) CRITICAL=$((CRITICAL + 1)) ;;
+      HIGH)     HIGH=$((HIGH + 1)) ;;
+      MEDIUM)   MEDIUM=$((MEDIUM + 1)) ;;
+    esac
+  fi
+done
 
 echo ""
 
@@ -166,13 +226,73 @@ echo ""
 # ═══════════════════════════════════════════════════════════
 echo -e "${BLUE}--- 📋 日志泄露检查 ---${NC}"
 
-LOG_LEAK=$(echo "$DIFF" | grep -E '(console\.(log|error|warn|debug|info)|println!|log\.|logger\.|logging\.)' | grep -iE '(password|secret|token|key|credential|pii|ssn|credit|card)' | head -5 || true)
-if [[ -n "$LOG_LEAK" ]]; then
-  echo -e "  ${RED}🛑 日志中打印了敏感数据${NC}"
-  CRITICAL=$((CRITICAL + 1))
-else
-  echo -e "  ${GREEN}✅ 通过${NC}"
-fi
+for entry in "${LOG_LEAK_PATTERNS[@]}"; do
+  pattern="${entry%%:*}"
+  rest="${entry#*:}"
+  name="${rest%%:*}"
+  level="${rest##*:}"
+
+  LOG_LEAK=$(echo "$DIFF_ADDED" | grep -iE "$pattern" 2>/dev/null | head -5 || true)
+  if [[ -n "$LOG_LEAK" ]]; then
+    print_result "$level" "日志中打印了敏感数据 ($name)"
+    echo "$LOG_LEAK" | while read -r m; do echo "     $m"; done
+    case "$level" in
+      CRITICAL) CRITICAL=$((CRITICAL + 1)) ;;
+      HIGH)     HIGH=$((HIGH + 1)) ;;
+    esac
+  else
+    echo -e "  ${GREEN}✅ 通过${NC}"
+  fi
+done
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════
+# 🔐 弱加密检测
+# ═══════════════════════════════════════════════════════════
+echo -e "${BLUE}--- 🔐 弱加密检测 ---${NC}"
+
+for entry in "${WEAK_CRYPTO_PATTERNS[@]}"; do
+  pattern="${entry%%:*}"
+  rest="${entry#*:}"
+  name="${rest%%:*}"
+  level="${rest##*:}"
+
+  MATCHES=$(echo "$DIFF_ADDED" | grep -iE "$pattern" 2>/dev/null | head -5 || true)
+  if [[ -n "$MATCHES" ]]; then
+    print_result "$level" "弱加密: $name"
+    echo "$MATCHES" | while read -r m; do echo "     $m"; done
+    case "$level" in
+      CRITICAL) CRITICAL=$((CRITICAL + 1)) ;;
+      HIGH)     HIGH=$((HIGH + 1)) ;;
+      MEDIUM)   MEDIUM=$((MEDIUM + 1)) ;;
+    esac
+  fi
+done
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════
+# ⚡ 危险函数调用
+# ═══════════════════════════════════════════════════════════
+echo -e "${BLUE}--- ⚡ 危险函数调用检测 ---${NC}"
+
+for entry in "${DANGEROUS_EXEC_PATTERNS[@]}"; do
+  pattern="${entry%%:*}"
+  rest="${entry#*:}"
+  name="${rest%%:*}"
+  level="${rest##*:}"
+
+  MATCHES=$(echo "$DIFF_ADDED" | grep -iE "$pattern" 2>/dev/null | head -5 || true)
+  if [[ -n "$MATCHES" ]]; then
+    print_result "$level" "危险函数: $name"
+    echo "$MATCHES" | while read -r m; do echo "     $m"; done
+    case "$level" in
+      CRITICAL) CRITICAL=$((CRITICAL + 1)) ;;
+      HIGH)     HIGH=$((HIGH + 1)) ;;
+    esac
+  fi
+done
 
 echo ""
 
@@ -184,6 +304,17 @@ echo -e "  🔴 CRITICAL: $CRITICAL"
 echo -e "  🟠 HIGH:     $HIGH"
 echo -e "  🟡 MEDIUM:   $MEDIUM"
 echo ""
+
+# --- 清理临时 git 分支 (trap 注册的函数会在 EXIT 时自动运行) ---
+# 如果没有注册 trap，手动清理
+if [[ -n "${PR_NUM:-}" ]]; then
+  git branch -D "pr-${PR_NUM}" 2>/dev/null || true
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo -e "${YELLOW}(dry-run mode — 不阻止)${NC}"
+  exit 0
+fi
 
 if [[ "$CRITICAL" -gt 0 ]]; then
   echo -e "${RED}🔴 BLOCKED — 存在严重安全/隐私问题，禁止合并${NC}"

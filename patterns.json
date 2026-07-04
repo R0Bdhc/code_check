@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "description": "Canonical detection patterns for code_check — single source of truth for all consumers (bash, Node.js, CI)",
+  "entropy": {
+    "threshold": 40,
+    "excludePatterns": [
+      "^[0-9a-fA-F]{40}$",
+      "^[0-9a-fA-F]{64}$",
+      "^[0-9a-fA-F]{128}$",
+      "^index\\s+[0-9a-f]{7,}"
+    ]
+  },
+  "patterns": {
+    "secrets": [
+      { "name": "AWS Access Key",          "regex": "AKIA[0-9A-Z]{16}",                          "level": "CRITICAL" },
+      { "name": "Stripe Live Key",         "regex": "sk_live_[0-9a-zA-Z]{24,}",                  "level": "CRITICAL" },
+      { "name": "GitHub Token",            "regex": "ghp_[0-9a-zA-Z]{36}",                        "level": "CRITICAL" },
+      { "name": "GitHub OAuth",            "regex": "gho_[0-9a-zA-Z]{36}",                        "level": "CRITICAL" },
+      { "name": "GitHub Fine-grained PAT", "regex": "github_pat_[A-Za-z0-9_]{36,}",              "level": "CRITICAL" },
+      { "name": "Slack Token",             "regex": "xox[baprs]-[0-9a-zA-Z-]{10,}",               "level": "CRITICAL" },
+      { "name": "Google API Key",          "regex": "AIza[0-9A-Za-z\\-_]{35}",                    "level": "CRITICAL" },
+      { "name": "OpenAI API Key",          "regex": "sk-(?:proj-|org-)?[A-Za-z0-9]{32,}",        "level": "CRITICAL" },
+      { "name": "JWT Token",               "regex": "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}", "level": "CRITICAL" },
+      { "name": "Private Key Block",       "regex": "-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----", "level": "CRITICAL" },
+      { "name": "Generic Secret Assignment","regex": "(?:secret|token|password|api_key|apikey)\\s*[:=]\\s*[\"'][^\"']{8,}[\"']", "level": "CRITICAL", "flags": "i" }
+    ],
+    "pii": [
+      { "name": "Chinese Phone",           "regex": "1[3-9]\\d{9}",                              "level": "HIGH" },
+      { "name": "Chinese ID Card",         "regex": "[1-9]\\d{5}(?:19|20)\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])\\d{3}[\\dXx]", "level": "CRITICAL" },
+      { "name": "Email (non-test)",        "regex": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", "level": "HIGH",
+        "exclude": ["test@", "example@", "localhost", "@test", "@example", "@localhost", "your-?email"] },
+      { "name": "IP Address (non-private)","regex": "\\b(?!127\\.|10\\.|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.|0\\.0\\.0\\.0|169\\.254\\.|22[4-9]\\.|23[0-9]\\.)(\\d{1,3}\\.){3}\\d{1,3}\\b", "level": "MEDIUM" }
+    ],
+    "logLeak": [
+      { "name": "Log Sensitive Data",      "regex": "(?:console\\.(?:log|error|warn|debug|info)|println!|log\\.|logger\\.|logging\\.)[^(]*\\([^)]*(?:password|secret|token|key|credential|pii|ssn|credit|card)[^)]*\\)", "level": "CRITICAL", "flags": "i" }
+    ],
+    "weakCrypto": [
+      { "name": "Weak Hash (MD5/SHA1)",    "regex": "\\b(?:MD5|SHA-?1)\\b",                      "level": "HIGH", "flags": "i" },
+      { "name": "Weak Cipher (DES/RC4)",   "regex": "\\b(?:DES|RC4|ECB\\s+mode)\\b",             "level": "HIGH", "flags": "i" }
+    ],
+    "dangerousExec": [
+      { "name": "Dangerous Function Call", "regex": "\\b(?:eval|exec|system|shell_exec|popen|subprocess\\.call)\\s*\\(", "level": "HIGH", "flags": "i" }
+    ]
+  }
+}
