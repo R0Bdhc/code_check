@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# ============================================================
+# pre-push-review — Git Pre-Push Hook
+# ============================================================
+# 在 git push 之前自动运行安全和隐私审查。
+# 安装: cp hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# 环境变量:
+#   REVIEW_MODE=strict   — 有 HIGH 就阻止 (默认: 仅 CRITICAL 阻止)
+#   REVIEW_MODE=warn     — 永远不阻止，仅警告
+#   SKIP_REVIEW=1        — 跳过审查 (紧急情况使用)
+# ============================================================
+
+set -euo pipefail
+
+# --- 颜色 ---
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# --- 配置 ---
+REVIEW_MODE="${REVIEW_MODE:-normal}"  # normal | strict | warn
+
+# --- 跳过审查 ---
+if [[ "${SKIP_REVIEW:-0}" == "1" ]]; then
+  echo -e "${YELLOW}⚠️  SKIP_REVIEW=1 — 跳过推送前审查${NC}"
+  exit 0
+fi
+
+echo -e "${BLUE}🔍 pre-push-review — 正在审查即将推送的改动...${NC}"
+echo ""
+
+# --- 获取改动 ---
+FAILED=0
+WARNINGS=0
+
+# 获取远程分支
+REMOTE="${1:-origin}"
+URL="${2:-}"
+
+while read LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+  if [[ "$REMOTE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+    # 新分支 — 审查所有 commits
+    RANGE=""
+    echo "→ 新分支，审查所有改动"
+    DIFF_FILES=$(git diff --name-only HEAD)
+  else
+    RANGE="${REMOTE_SHA}..${LOCAL_SHA}"
+    echo "→ 审查范围: ${RANGE}"
+    DIFF_FILES=$(git diff --name-only "${RANGE}")
+  fi
+
+  if [[ -z "$DIFF_FILES" ]]; then
+    echo "  无改动文件，跳过。"
+    continue
+  fi
+
+  echo "  改动文件:"
+  echo "$DIFF_FILES" | sed 's/^/    /'
+
+  # ============================================================
+  # 1. 安全扫描 — 硬编码密钥/Token
+  # ============================================================
+  echo ""
+  echo -e "${BLUE}--- 🔒 安全扫描 ---${NC}"
+
+  # 检测高熵字符串 (可能的密钥/Token)
+  HIGH_ENTROPY=$(git diff ${RANGE:-HEAD} | grep -oE '[A-Za-z0-9+/=]{40,}' | sort -u | head -20 || true)
+  if [[ -n "$HIGH_ENTROPY" ]]; then
+    echo -e "${YELLOW}  ⚠️  检测到高熵字符串（可能是密钥/Token）${NC}"
+    echo "$HIGH_ENTROPY" | while read line; do echo "     $line"; done
+    WARNINGS=$((WARNINGS + 1))
+  fi
+
+  # 检测常见密钥模式
+  SECRET_PATTERNS=(
+    'AKIA[0-9A-Z]{16}'                    # AWS Access Key
+    'sk_live_[0-9a-zA-Z]{24,}'            # Stripe Live Key
+    'ghp_[0-9a-zA-Z]{36}'                 # GitHub Personal Token
+    'gho_[0-9a-zA-Z]{36}'                 # GitHub OAuth Token
+    'xox[baprs]-[0-9a-zA-Z-]{10,}'        # Slack Token
+    'AIza[0-9A-Za-z\-_]{35}'              # Google API Key
+  )
+
+  if [[ -n "${RANGE:-}" ]]; then
+    DIFF_CMD="git diff ${RANGE}"
+  else
+    DIFF_CMD="git diff HEAD"
+  fi
+
+  for pattern in "${SECRET_PATTERNS[@]}"; do
+    MATCHES=$($DIFF_CMD | grep -oE "$pattern" | sort -u || true)
+    if [[ -n "$MATCHES" ]]; then
+      echo -e "${RED}  🛑 检测到密钥模式: ${pattern}${NC}"
+      echo "$MATCHES" | while read line; do echo "     $line"; done
+      FAILED=$((FAILED + 1))
+    fi
+  done
+
+  # 检测 .env 文件是否在改动中
+  if echo "$DIFF_FILES" | grep -qE '(\.env$|\.env\.local$|\.env\.production$)' ; then
+    echo -e "${RED}  🛑 .env 文件在改动中！可能泄露环境变量${NC}"
+    FAILED=$((FAILED + 1))
+  fi
+
+  # ============================================================
+  # 2. 隐私扫描 — PII 检测
+  # ============================================================
+  echo ""
+  echo -e "${BLUE}--- 🛡️ 隐私扫描 ---${NC}"
+
+  # 中国手机号
+  PHONE_MATCHES=$($DIFF_CMD | grep -oE '1[3-9][0-9]{9}' | sort -u || true)
+  PHONE_COUNT=$(echo "$PHONE_MATCHES" | grep -c . || echo 0)
+  if [[ "$PHONE_COUNT" -gt 0 ]]; then
+    echo -e "${RED}  🛑 检测到 ${PHONE_COUNT} 处疑似手机号${NC}"
+    echo "$PHONE_MATCHES" | head -5 | while read line; do echo "     $line"; done
+    FAILED=$((FAILED + 1))
+  fi
+
+  # 身份证号
+  ID_MATCHES=$($DIFF_CMD | grep -oE '[1-9][0-9]{5}(19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]' | sort -u || true)
+  ID_COUNT=$(echo "$ID_MATCHES" | grep -c . || echo 0)
+  if [[ "$ID_COUNT" -gt 0 ]]; then
+    echo -e "${RED}  🛑 检测到 ${ID_COUNT} 处疑似身份证号！${NC}"
+    echo "$ID_MATCHES" | head -5 | while read line; do echo "     $line"; done
+    FAILED=$((FAILED + 1))
+  fi
+
+  # 邮箱地址 (排除 test/example/localhost)
+  EMAIL_MATCHES=$($DIFF_CMD | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | grep -vE '(test@|example@|localhost|@test|@example|@localhost|your-?email)' | sort -u || true)
+  EMAIL_COUNT=$(echo "$EMAIL_MATCHES" | grep -c . || echo 0)
+  if [[ "$EMAIL_COUNT" -gt 0 ]]; then
+    echo -e "${YELLOW}  ⚠️  检测到 ${EMAIL_COUNT} 处疑似真实邮箱${NC}"
+    echo "$EMAIL_MATCHES" | head -5 | while read line; do echo "     $line"; done
+    WARNINGS=$((WARNINGS + 1))
+  fi
+
+  # IP 地址 (排除 localhost/私有地址/测试地址)
+  IP_MATCHES=$($DIFF_CMD | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -vE '(^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^0\.0\.0\.0)' | sort -u || true)
+  IP_COUNT=$(echo "$IP_MATCHES" | grep -c . || echo 0)
+  if [[ "$IP_COUNT" -gt 0 ]]; then
+    echo -e "${YELLOW}  ⚠️  检测到 ${IP_COUNT} 处疑似真实 IP 地址${NC}"
+    echo "$IP_MATCHES" | head -5 | while read line; do echo "     $line"; done
+    WARNINGS=$((WARNINGS + 1))
+  fi
+
+  # ============================================================
+  # 3. 日志泄露检测
+  # ============================================================
+  echo ""
+  echo -e "${BLUE}--- 📋 日志泄露检测 ---${NC}"
+
+  LOG_LEAKS=$($DIFF_CMD | grep -E '(console\.(log|error|warn|debug|info)|println!|log\.|logger\.|logging\.)' | grep -iE '(password|secret|token|key|credential|pii|ssn|credit|card)' | head -10 || true)
+  if [[ -n "$LOG_LEAKS" ]]; then
+    echo -e "${RED}  🛑 检测到日志中可能打印了敏感数据！${NC}"
+    echo "$LOG_LEAKS" | while read line; do echo "     $line"; done
+    FAILED=$((FAILED + 1))
+  else
+    echo "  ✅ 未发现日志泄露"
+  fi
+
+done
+
+# ============================================================
+# 结论
+# ============================================================
+echo ""
+echo -e "${BLUE}============================================${NC}"
+
+if [[ "$REVIEW_MODE" == "warn" ]]; then
+  echo -e "${YELLOW}⚠️  REVIEW_MODE=warn — 审查完成，不阻止推送${NC}"
+  echo -e "${YELLOW}   发现 ${FAILED} 个严重问题，${WARNINGS} 个警告${NC}"
+  exit 0
+fi
+
+if [[ "$REVIEW_MODE" == "strict" ]] && [[ "$WARNINGS" -gt 0 ]]; then
+  FAILED=$((FAILED + WARNINGS))
+fi
+
+if [[ "$FAILED" -gt 0 ]]; then
+  echo -e "${RED}🛑 BLOCKED — 发现 ${FAILED} 个阻塞性问题，推送已阻止${NC}"
+  echo ""
+  echo "  修复以上问题后重新推送。"
+  echo "  紧急情况可运行: SKIP_REVIEW=1 git push"
+  exit 1
+fi
+
+echo -e "${GREEN}✅ CLEAR — 审查通过，允许推送${NC}"
+[[ "$WARNINGS" -gt 0 ]] && echo -e "${YELLOW}   ${WARNINGS} 个非阻塞警告，建议推送后修复${NC}"
+exit 0

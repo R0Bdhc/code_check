@@ -1,0 +1,33 @@
+# CI for the pre-push-review repository itself
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run CLI self-test
+        run: |
+          cd cli
+          npm install
+          # Self-test: scan our own repo for false positives
+          node index.js --all --ci
+
+      - name: Validate hook syntax
+        run: bash -n hooks/pre-push
+
+      - name: Validate SKILL.md frontmatter
+        run: |
+          head -10 SKILL.md | grep -q 'Pre-Push Review' && echo "SKILL.md OK" || (echo "SKILL.md invalid" && exit 1)
